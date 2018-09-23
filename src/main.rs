@@ -33,11 +33,11 @@ struct Mesh {
 }
 
 impl Mesh {
-    fn get_vertex_faces(&self, vertex: VertexIndex, buf: &mut Vec<FaceIndex>) {
+    fn get_vertex_face_ids(&self, vertex_id: VertexIndex, buf: &mut Vec<FaceIndex>) {
         for (index, face) in self.faces.iter().enumerate() {
-            if face.0 == vertex
-            || face.1 == vertex
-            || face.2 == vertex
+            if face.0 == vertex_id
+            || face.1 == vertex_id
+            || face.2 == vertex_id
             {
                 buf.push(FaceIndex(index as u8));
             }
@@ -413,15 +413,15 @@ fn main() {
         if need_selection_update { unsafe {
             // get the raycast result, testing previous selection first
             let raycast = selection.as_ref().and_then(|selection| match *selection {
-                Selection::Face(face) => {
-                    let triangle = mesh.get_face_points(mesh[face]);
-                    raycast_triangle(triangle, mouse_ray).map(|pos| (pos, face))
+                Selection::Face(face_id) => {
+                    let triangle = mesh.get_face_points(mesh[face_id]);
+                    raycast_triangle(triangle, mouse_ray).map(|pos| (pos, face_id))
                 },
-                Selection::Vertex(_, ref faces) => {
+                Selection::Vertex(_, ref face_ids) => {
                     let mut raycast = None;
-                    for &face in faces.iter() {
-                        let triangle = mesh.get_face_points(mesh[face]);
-                        raycast = raycast_triangle(triangle, mouse_ray).map(|pos| (pos, face));
+                    for &face_id in face_ids.iter() {
+                        let triangle = mesh.get_face_points(mesh[face_id]);
+                        raycast = raycast_triangle(triangle, mouse_ray).map(|pos| (pos, face_id));
                         if raycast.is_some() { break; }
                     }
                     raycast
@@ -429,21 +429,21 @@ fn main() {
             }).or_else(|| raycast_mesh(&mesh, mouse_ray));
 
             // convert raycast into selection
-            let new_selection = raycast.map(|(pos, face)| {
-                let bary = barycentric(mesh.get_face_points(mesh[face]), pos);
+            let new_selection = raycast.map(|(pos, face_id)| {
+                let bary = barycentric(mesh.get_face_points(mesh[face_id]), pos);
 
                 const VERTEX_SELECT_THRESHOLD: f32 = 0.9;
                 let selected_vertex = {
-                    if      bary.x >= VERTEX_SELECT_THRESHOLD { Some(mesh[face].0) }
-                    else if bary.y >= VERTEX_SELECT_THRESHOLD { Some(mesh[face].1) }
-                    else if bary.z >= VERTEX_SELECT_THRESHOLD { Some(mesh[face].2) }
+                    if      bary.x >= VERTEX_SELECT_THRESHOLD { Some(mesh[face_id].0) }
+                    else if bary.y >= VERTEX_SELECT_THRESHOLD { Some(mesh[face_id].1) }
+                    else if bary.z >= VERTEX_SELECT_THRESHOLD { Some(mesh[face_id].2) }
                     else                                      { None               }
                 };
 
-                if let Some(vertex) = selected_vertex {
-                    Selection::Vertex(vertex, Vec::new())
+                if let Some(vertex_id) = selected_vertex {
+                    Selection::Vertex(vertex_id, Vec::new())
                 } else {
-                    Selection::Face(face)
+                    Selection::Face(face_id)
                 }
             });
 
@@ -455,14 +455,14 @@ fn main() {
                 // finalise specific selection variants, update render buffer
                 if let Some(ref mut selection) = selection {
                     match *selection {
-                        Selection::Face(face) => {
-                            let points = mesh.get_face_points(mesh[face]);
+                        Selection::Face(face_id) => {
+                            let points = mesh.get_face_points(mesh[face_id]);
                             selection_highlight.extend_from_slice(&points);
                         },
-                        Selection::Vertex(vertex, ref mut faces) => {
-                            mesh.get_vertex_faces(vertex, faces);
-                            for &face in faces.iter() {
-                                let face_verts = mesh.get_face_points(mesh[face]);
+                        Selection::Vertex(vertex_id, ref mut face_ids) => {
+                            mesh.get_vertex_face_ids(vertex_id, face_ids);
+                            for &face_id in face_ids.iter() {
+                                let face_verts = mesh.get_face_points(mesh[face_id]);
                                 selection_highlight.extend_from_slice(&face_verts);
                             }
                         },
@@ -654,8 +654,8 @@ fn compile_shader(src: &str, ty: GLenum) -> GLuint {
     unsafe {
         let shader = gl::CreateShader(ty);
         gl::ShaderSource(
-            shader, 1, 
-            &(src.as_ptr() as *const GLchar) as *const *const _, 
+            shader, 1,
+            &(src.as_ptr() as *const GLchar) as *const *const _,
             &(src.len() as GLint) as *const _
         );
         gl::CompileShader(shader);
