@@ -1,0 +1,21 @@
+version(1);
+
+project_name = "niwa-rs";
+
+patterns = {
+	"*.4coder",
+	"Cargo.toml",
+	"*.rs",
+	"*.glsl",
+};
+
+srcs = { 
+	{ ".", .recursive = false },
+	{ "./src" },
+};
+
+load_paths = {
+	{ srcs, .os = "win" },
+	{ srcs, .os = "mac" },
+	{ srcs, .os = "linux" },
+};

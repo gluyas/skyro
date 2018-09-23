@@ -1,0 +1,9 @@
+[package]
+name = "skyro"
+version = "0.1.0"
+authors = ["Marc <marc.gluyas@gmail.com>"]
+
+[dependencies]
+cgmath = "*"
+gl = "*"
+glutin = "*"
