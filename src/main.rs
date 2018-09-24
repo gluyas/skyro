@@ -35,13 +35,23 @@ struct Mesh {
 impl Mesh {
     fn get_vertex_face_ids(&self, vertex_id: VertexIndex, buf: &mut Vec<FaceIndex>) {
         for (index, face) in self.faces.iter().enumerate() {
-            if face.0 == vertex_id
-            || face.1 == vertex_id
-            || face.2 == vertex_id
-            {
+            if face.has_vertex(vertex_id) {
                 buf.push(FaceIndex(index as u8));
             }
         }
+    }
+
+    fn get_edge_face_ids(&self, edge: Edge) -> [FaceIndex; 2] {
+        let mut face_ids = [FaceIndex::default(); 2];
+        let mut i = 0;
+        for (index, face) in self.faces.iter().enumerate() {
+            if face.has_edge(edge) {
+                face_ids[i] = FaceIndex(index as u8);
+                i += 1;
+                if i == 2 { return face_ids; }
+            }
+        }
+        panic!("failed to find two faces adjacent to edge");
     }
 
     fn get_face_verts(&self, face: Face) -> [Vertex; 3] {
@@ -90,6 +100,44 @@ impl IndexMut<VertexIndex> for Mesh {
 struct Face (
     VertexIndex, VertexIndex, VertexIndex,
 );
+
+impl Face {
+    fn edges(&self) -> [Edge; 3] {
+        [ Edge(self.0, self.1)
+        , Edge(self.1, self.2)
+        , Edge(self.2, self.0)
+        ]
+    }
+
+    #[inline]
+    fn has_edge(&self, edge: Edge) -> bool {
+        self.has_vertex(edge.0) && self.has_vertex(edge.1)
+    }
+
+    #[inline]
+    fn has_vertex(&self, vertex_id: VertexIndex) -> bool {
+        self.0 == vertex_id || self.1 == vertex_id || self.2 == vertex_id
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+struct Edge(VertexIndex, VertexIndex);
+
+impl Edge {
+    #[inline]
+    fn has_vertex(&self, vertex_id: VertexIndex) -> bool {
+        self.0 == vertex_id || self.1 == vertex_id
+    }
+}
+
+impl PartialEq for Edge {
+    fn eq(&self, other: &Edge) -> bool {
+        (self.0 == other.0 && self.1 == other.1) ||
+        (self.0 == other.1 && self.1 == other.0)
+    }
+}
+impl Eq for Edge {}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -254,12 +302,14 @@ fn main() {
     enum Selection {
         Face(FaceIndex),
         Vertex(VertexIndex, Vec<FaceIndex>),
+        Edge(Edge, [FaceIndex; 2]),
     }
     impl PartialEq for Selection {
         fn eq(&self, other: &Selection) -> bool {
             match (self, other) {
                 (Selection::Face(a),      Selection::Face(b))      => a == b,
                 (Selection::Vertex(a, _), Selection::Vertex(b, _)) => a == b,
+                (Selection::Edge(a, _),   Selection::Edge(b, _))   => a == b,
                 _                                                  => false,
             }
         }
@@ -421,7 +471,18 @@ fn main() {
                     let mut raycast = None;
                     for &face_id in face_ids.iter() {
                         let triangle = mesh.get_face_points(mesh[face_id]);
-                        raycast = raycast_triangle(triangle, mouse_ray).map(|pos| (pos, face_id));
+                        raycast = raycast_triangle(triangle, mouse_ray)
+                            .map(|pos| (pos, face_id));
+                        if raycast.is_some() { break; }
+                    }
+                    raycast
+                },
+                Selection::Edge(_, ref face_ids) => {
+                    let mut raycast = None;
+                    for &face_id in face_ids.iter() {
+                        let triangle = mesh.get_face_points(mesh[face_id]);
+                        raycast = raycast_triangle(triangle, mouse_ray)
+                            .map(|pos| (pos, face_id));
                         if raycast.is_some() { break; }
                     }
                     raycast
@@ -430,21 +491,31 @@ fn main() {
 
             // convert raycast into selection
             let new_selection = raycast.map(|(pos, face_id)| {
-                let bary = barycentric(mesh.get_face_points(mesh[face_id]), pos);
+                let face = mesh[face_id];
+                let bary = barycentric(mesh.get_face_points(face), pos);
 
                 const VERTEX_SELECT_THRESHOLD: f32 = 0.9;
-                let selected_vertex = {
-                    if      bary.x >= VERTEX_SELECT_THRESHOLD { Some(mesh[face_id].0) }
-                    else if bary.y >= VERTEX_SELECT_THRESHOLD { Some(mesh[face_id].1) }
-                    else if bary.z >= VERTEX_SELECT_THRESHOLD { Some(mesh[face_id].2) }
-                    else                                      { None               }
-                };
+                const EDGE_SELECT_THRESHOLD:   f32 = 0.05;
 
-                if let Some(vertex_id) = selected_vertex {
-                    Selection::Vertex(vertex_id, Vec::new())
-                } else {
-                    Selection::Face(face_id)
-                }
+                (            // first check vertex seleciton
+                    {   if      bary.x >= VERTEX_SELECT_THRESHOLD { Some(face.0) }
+                        else if bary.y >= VERTEX_SELECT_THRESHOLD { Some(face.1) }
+                        else if bary.z >= VERTEX_SELECT_THRESHOLD { Some(face.2) }
+                        else                                      { None         }
+                    }.map(
+                        |vertex_id| Selection::Vertex(vertex_id, Default::default())
+                    )
+                ).or_else(|| // if not, check for edge selection
+                    {   if      bary.x <= EDGE_SELECT_THRESHOLD { Some(Edge(face.1, face.2)) }
+                        else if bary.y <= EDGE_SELECT_THRESHOLD { Some(Edge(face.2, face.0)) }
+                        else if bary.z <= EDGE_SELECT_THRESHOLD { Some(Edge(face.0, face.1)) }
+                        else                                    { None                       }
+                    }.map(
+                        |edge|      Selection::Edge(edge, Default::default())
+                    )
+                ).unwrap_or(  // otherwise select the whole face
+                                    Selection::Face(face_id)
+                )
             });
 
             // update selection
@@ -461,6 +532,13 @@ fn main() {
                         },
                         Selection::Vertex(vertex_id, ref mut face_ids) => {
                             mesh.get_vertex_face_ids(vertex_id, face_ids);
+                            for &face_id in face_ids.iter() {
+                                let face_verts = mesh.get_face_points(mesh[face_id]);
+                                selection_highlight.extend_from_slice(&face_verts);
+                            }
+                        },
+                        Selection::Edge(edge, ref mut face_ids) => {
+                            *face_ids = mesh.get_edge_face_ids(edge);
                             for &face_id in face_ids.iter() {
                                 let face_verts = mesh.get_face_points(mesh[face_id]);
                                 selection_highlight.extend_from_slice(&face_verts);
