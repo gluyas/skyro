@@ -1,15 +1,19 @@
 extern crate gl;
+extern crate glutin;
+extern crate cgmath;
+
+mod mesh;
+
 use gl::types::*;
 
-extern crate glutin;
 use glutin::*;
 
-extern crate cgmath;
 use cgmath::*;
 
+use mesh::*;
+
 use std::default::Default;
-use std::mem::{self, size_of};
-use std::ops::{Index, IndexMut};
+use std::mem::size_of;
 use std::os::raw::c_char;
 use std::ptr;
 
@@ -17,201 +21,6 @@ macro_rules! cstr {
     ($s:expr) => (
         concat!($s, "\0") as *const str as *const [c_char] as *const c_char
     );
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-struct FaceIndex(u8);
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-struct VertexIndex(u8);
-
-struct Mesh {
-    verts: Box<[Vertex]>,
-    faces: Box<[Face]>,
-}
-
-impl Mesh {
-    fn get_vertex_face_ids(&self, vertex_id: VertexIndex, buf: &mut Vec<FaceIndex>) {
-        for (index, face) in self.faces.iter().enumerate() {
-            if face.has_vertex(vertex_id) {
-                buf.push(FaceIndex(index as u8));
-            }
-        }
-    }
-
-    fn get_edge_face_ids(&self, edge: Edge) -> [FaceIndex; 2] {
-        let mut face_ids = [FaceIndex::default(); 2];
-        let mut i = 0;
-        for (index, face) in self.faces.iter().enumerate() {
-            if face.has_edge(edge) {
-                face_ids[i] = FaceIndex(index as u8);
-                i += 1;
-                if i == 2 { return face_ids; }
-            }
-        }
-        panic!("failed to find two faces adjacent to edge");
-    }
-
-    fn get_face_verts(&self, face: Face) -> [Vertex; 3] {
-        [self[face.0], self[face.1], self[face.2]]
-    }
-
-    fn get_face_points(&self, face: Face) -> [Point3<f32>; 3] {
-        [self[face.0].pos, self[face.1].pos, self[face.2].pos]
-    }
-}
-
-impl Index<FaceIndex> for Mesh {
-    type Output = Face;
-
-    #[inline]
-    fn index(&self, index: FaceIndex) -> &Self::Output {
-        &self.faces[index.0 as usize]
-    }
-}
-
-impl IndexMut<FaceIndex> for Mesh {
-    #[inline]
-    fn index_mut(&mut self, index: FaceIndex) -> &mut Self::Output {
-        &mut self.faces[index.0 as usize]
-    }
-}
-
-impl Index<VertexIndex> for Mesh {
-    type Output = Vertex;
-
-    #[inline]
-    fn index(&self, index: VertexIndex) -> &Self::Output {
-        &self.verts[index.0 as usize]
-    }
-}
-
-impl IndexMut<VertexIndex> for Mesh {
-    #[inline]
-    fn index_mut(&mut self, index: VertexIndex) -> &mut Self::Output {
-        &mut self.verts[index.0 as usize]
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-struct Face (
-    VertexIndex, VertexIndex, VertexIndex,
-);
-
-impl Face {
-    fn edges(&self) -> [Edge; 3] {
-        [ Edge(self.0, self.1)
-        , Edge(self.1, self.2)
-        , Edge(self.2, self.0)
-        ]
-    }
-
-    #[inline]
-    fn has_edge(&self, edge: Edge) -> bool {
-        self.has_vertex(edge.0) && self.has_vertex(edge.1)
-    }
-
-    #[inline]
-    fn has_vertex(&self, vertex_id: VertexIndex) -> bool {
-        self.0 == vertex_id || self.1 == vertex_id || self.2 == vertex_id
-    }
-
-    fn vertex_opposite(&self, edge: Edge) -> VertexIndex {
-        assert!(self.has_edge(edge), "Face does not contain given edge");
-        for &vertex_id in self.as_ref().iter() {
-            if !edge.has_vertex(vertex_id) { return vertex_id; }
-        }
-        panic!("Face contains duplicate vertices");
-    }
-
-    fn edge_opposite(&self, vertex_id: VertexIndex) -> Edge {
-        let slice = self.as_ref();
-        for i in 0..3 {
-            if slice[i] == vertex_id {
-                return Edge(slice[(i+1)%3], slice[(i+2)%3]);
-            }
-        }
-        panic!("Face does not contain given vertex");
-    }
-
-    fn edges_opposite(&self, edge: Edge) -> [Edge; 2] {
-        let apex = self.vertex_opposite(edge);
-        [Edge(edge.0, apex), Edge(apex, edge.1)] // TODO: check vertex order
-    }
-}
-
-impl AsRef<[VertexIndex; 3]> for Face {
-    fn as_ref(&self) -> &[VertexIndex; 3] {
-        unsafe { mem::transmute(self) }
-    }
-}
-
-impl AsMut<[VertexIndex; 3]> for Face {
-    fn as_mut(&mut self) -> &mut [VertexIndex; 3] {
-        unsafe { mem::transmute(self) }
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-struct Edge(VertexIndex, VertexIndex);
-
-impl Edge {
-    #[inline]
-    fn has_vertex(&self, vertex_id: VertexIndex) -> bool {
-        self.0 == vertex_id || self.1 == vertex_id
-    }
-}
-
-impl AsRef<[VertexIndex; 2]> for Edge {
-    #[inline]
-    fn as_ref(&self) -> &[VertexIndex; 2] {
-        unsafe { mem::transmute(self) }
-    }
-}
-
-impl AsMut<[VertexIndex; 2]> for Edge {
-    #[inline]
-    fn as_mut(&mut self) -> &mut [VertexIndex; 2] {
-        unsafe { mem::transmute(self) }
-    }
-}
-
-impl PartialEq for Edge {
-    fn eq(&self, other: &Edge) -> bool {
-        (self.0 == other.0 && self.1 == other.1) ||
-        (self.0 == other.1 && self.1 == other.0)
-    }
-}
-impl Eq for Edge {}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-struct Vertex {
-    pos: Point3<f32>,
-    color: Vector3<f32>,
-}
-
-impl Vertex {
-    #[inline]
-    fn at(pos: impl Into<Point3<f32>>) -> Vertex {
-        Vertex {
-            pos: pos.into(),
-            color: Vector3 { x: 0.0, y: 0.0, z: 0.0 },
-        }
-    }
-}
-
-impl Default for Vertex {
-    fn default() -> Self {
-        Vertex {
-            pos: Point3 { x: 0.0, y: 0.0, z: 0.0 },
-            color: Vector3 { x: 0.0, y: 0.0, z: 0.0 },
-        }
-    }
 }
 
 const WIDTH: u32 = 1280;
@@ -272,14 +81,12 @@ fn main() {
     };
 
     let (mut mesh, mesh_vao, mesh_vbo, mesh_ebo) = unsafe {
-        let (mut verts, faces) = make_icosahedron();
-        for mut vert in verts.iter_mut() {
+        let mut mesh = make_icosahedron();
+        for mut vert in mesh.verts.iter_mut() {
             vert.color.x = vert.pos.x / 2.0 + 0.5;
             vert.color.y = vert.pos.y / 2.0 + 0.5;
             vert.color.z = vert.pos.z / 2.0 + 0.5;
         }
-
-        let mesh = Mesh { verts: Box::new(verts), faces: Box::new(faces) };
 
         let vao = gen_object(gl::GenVertexArrays);
         gl::BindVertexArray(vao);
@@ -288,7 +95,7 @@ fn main() {
         gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
         gl::BufferData(
             gl::ARRAY_BUFFER,
-            (size_of::<Vertex>() * verts.len()) as GLsizeiptr,
+            (size_of::<Vertex>() * mesh.verts.len()) as GLsizeiptr,
             mesh.verts.as_ptr() as *const GLvoid,
             gl::STATIC_DRAW,
         );
@@ -309,7 +116,7 @@ fn main() {
         gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
         gl::BufferData(
             gl::ELEMENT_ARRAY_BUFFER,
-            (size_of::<Face>() * faces.len()) as GLsizeiptr,
+            (size_of::<Face>() * mesh.faces.len()) as GLsizeiptr,
             mesh.faces.as_ptr() as *const GLvoid,
             gl::STATIC_DRAW,
         );
@@ -713,13 +520,13 @@ fn raycast_mesh(mesh: &Mesh, ray: Ray) -> Option<(Point3<f32>, FaceIndex)> {
         .nth(0) // ASSUMPTION: no mesh faces lie in front or behind another
 }
 
-fn make_icosahedron() -> ([Vertex; 12], [Face; 20]) {
+fn make_icosahedron() -> Mesh {
     fn face(v0: usize, v1: usize, v2: usize) -> Face {
         Face(VertexIndex(v0 as u8), VertexIndex(v1 as u8), VertexIndex(v2 as u8))
     }
 
     // construct icosahedron as a gyroelongated bipyramid
-    let mut verts = <[Vertex; 12]>::default();
+    let mut verts = vec![Vertex::default(); 12];
 
     // set vertex at apex on unit sphere
     verts[5]  = Vertex::at(Point3::new(0.0, 0.0, 1.0));
@@ -743,7 +550,7 @@ fn make_icosahedron() -> ([Vertex; 12], [Face; 20]) {
         verts[6 + i] = Vertex::at(twist.rotate_point(Point3::new(v.x, v.y, -v.z)));
     }
 
-    let mut faces = <[Face; 20]>::default();
+    let mut faces = vec![Face::default(); 20];
     // assemble top and bottom pyramid faces
     for i in 0..5 {
         faces[i] = face(i, 5, (i+1)%5);
@@ -755,7 +562,7 @@ fn make_icosahedron() -> ([Vertex; 12], [Face; 20]) {
         faces[14-i] = face(6+(i+1)%5, 6+i, (i+6)%5);
     }
 
-    (verts, faces)
+    Mesh { verts, faces }
 }
 
 #[inline]
