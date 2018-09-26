@@ -8,7 +8,7 @@ extern crate cgmath;
 use cgmath::*;
 
 use std::default::Default;
-use std::mem::size_of;
+use std::mem::{self, size_of};
 use std::ops::{Index, IndexMut};
 use std::os::raw::c_char;
 use std::ptr;
@@ -118,6 +118,41 @@ impl Face {
     fn has_vertex(&self, vertex_id: VertexIndex) -> bool {
         self.0 == vertex_id || self.1 == vertex_id || self.2 == vertex_id
     }
+
+    fn vertex_opposite(&self, edge: Edge) -> VertexIndex {
+        assert!(self.has_edge(edge), "Face does not contain given edge");
+        for &vertex_id in self.as_ref().iter() {
+            if !edge.has_vertex(vertex_id) { return vertex_id; }
+        }
+        panic!("Face contains duplicate vertices");
+    }
+
+    fn edge_opposite(&self, vertex_id: VertexIndex) -> Edge {
+        let slice = self.as_ref();
+        for i in 0..3 {
+            if slice[i] == vertex_id {
+                return Edge(slice[(i+1)%3], slice[(i+2)%3]);
+            }
+        }
+        panic!("Face does not contain given vertex");
+    }
+
+    fn edges_opposite(&self, edge: Edge) -> [Edge; 2] {
+        let apex = self.vertex_opposite(edge);
+        [Edge(edge.0, apex), Edge(apex, edge.1)] // TODO: check vertex order
+    }
+}
+
+impl AsRef<[VertexIndex; 3]> for Face {
+    fn as_ref(&self) -> &[VertexIndex; 3] {
+        unsafe { mem::transmute(self) }
+    }
+}
+
+impl AsMut<[VertexIndex; 3]> for Face {
+    fn as_mut(&mut self) -> &mut [VertexIndex; 3] {
+        unsafe { mem::transmute(self) }
+    }
 }
 
 #[repr(C)]
@@ -128,6 +163,20 @@ impl Edge {
     #[inline]
     fn has_vertex(&self, vertex_id: VertexIndex) -> bool {
         self.0 == vertex_id || self.1 == vertex_id
+    }
+}
+
+impl AsRef<[VertexIndex; 2]> for Edge {
+    #[inline]
+    fn as_ref(&self) -> &[VertexIndex; 2] {
+        unsafe { mem::transmute(self) }
+    }
+}
+
+impl AsMut<[VertexIndex; 2]> for Edge {
+    #[inline]
+    fn as_mut(&mut self) -> &mut [VertexIndex; 2] {
+        unsafe { mem::transmute(self) }
     }
 }
 
@@ -222,28 +271,6 @@ fn main() {
         (program, a_pos, a_color)
     };
 
-    let (highlight_vao, highlight_points_vbo) = unsafe {
-        let vao = gen_object(gl::GenVertexArrays);
-        gl::BindVertexArray(vao);
-
-        let vbo = gen_object(gl::GenBuffers);
-        gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
-        gl::BufferData(
-            gl::ARRAY_BUFFER,
-            15 as GLsizeiptr,
-            ptr::null() as *const GLvoid,
-            gl::DYNAMIC_DRAW,
-        );
-
-        gl::EnableVertexAttribArray(a_pos);
-        gl::VertexAttribPointer(
-            a_pos, 3, gl::FLOAT, gl::FALSE,
-            0 as GLsizei, ptr::null() as *const GLvoid,
-        );
-
-        (vao, vbo)
-    };
-
     let (mut mesh, mesh_vao, mesh_vbo, mesh_ebo) = unsafe {
         let (mut verts, faces) = make_icosahedron();
         for mut vert in verts.iter_mut() {
@@ -317,8 +344,10 @@ fn main() {
     impl Eq for Selection {}
 
     let mut selection: Option<Selection> = None;
-    let mut selection_highlight: Vec<Point3<f32>> = Vec::with_capacity(15);
     let mut selection_drag = false;
+    let mut selection_primary:   Vec<VertexIndex> = Vec::new();
+    let mut selection_secondary: Vec<VertexIndex> = Vec::new();
+    let mut selection_draw_mode: GLenum = gl::TRIANGLES;
 
     let mut need_render = true;
     let mut need_camera_update = true;
@@ -341,11 +370,7 @@ fn main() {
                     },
                     ElementState::Released => {
                         mouse_down = false;
-                        if selection_drag {
-                            need_selection_update = true; // HACK: makes bugged selection lines
-                            selection = None;             // snap into place after dragging
-                            selection_drag = false;
-                        }
+                        selection_drag = false;
                     },
                 },
                 WindowEvent::CursorMoved { position: pos, .. } => {
@@ -432,9 +457,7 @@ fn main() {
         }
 
         // update camera
-        if need_camera_update { unsafe {
-            gl::BindBuffer(gl::UNIFORM_BUFFER, mvp_ubo);
-
+        if need_camera_update {
             let camera_dir =
                 ( Quaternion::from_angle_z(camera_azimuth)
                 * Quaternion::from_angle_x(-camera_elevation)
@@ -448,19 +471,22 @@ fn main() {
                 Vector3::new(0.0, 0.0, 1.0),
             );
 
-            gl::BufferData(
-                gl::UNIFORM_BUFFER,
-                size_of::<Mvp>() as GLsizeiptr,
-                mvp.modelview.as_ptr() as *const GLvoid,
-                gl::DYNAMIC_DRAW,
-            );
+            unsafe {
+                gl::BindBuffer(gl::UNIFORM_BUFFER, mvp_ubo);
+                gl::BufferData(
+                    gl::UNIFORM_BUFFER,
+                    size_of::<Mvp>() as GLsizeiptr,
+                    mvp.modelview.as_ptr() as *const GLvoid,
+                    gl::DYNAMIC_DRAW,
+                );
+            }
 
             need_render = true;
             need_camera_update = false;
-        }}
+        }
 
         // find face under mouse cursor
-        if need_selection_update { unsafe {
+        if need_selection_update {
             // get the raycast result, testing previous selection first
             let raycast = selection.as_ref().and_then(|selection| match *selection {
                 Selection::Face(face_id) => {
@@ -521,44 +547,43 @@ fn main() {
             // update selection
             if new_selection != selection {
                 selection = new_selection;
-                selection_highlight.clear();
+                selection_primary.clear();
+                selection_secondary.clear();
 
                 // finalise specific selection variants, update render buffer
                 if let Some(ref mut selection) = selection {
                     match *selection {
                         Selection::Face(face_id) => {
-                            let points = mesh.get_face_points(mesh[face_id]);
-                            selection_highlight.extend_from_slice(&points);
+                            selection_secondary.extend_from_slice(mesh[face_id].as_ref());
+                            selection_draw_mode = gl::TRIANGLES;
                         },
                         Selection::Vertex(vertex_id, ref mut face_ids) => {
                             mesh.get_vertex_face_ids(vertex_id, face_ids);
                             for &face_id in face_ids.iter() {
-                                let face_verts = mesh.get_face_points(mesh[face_id]);
-                                selection_highlight.extend_from_slice(&face_verts);
+                                let opp = mesh[face_id].edge_opposite(vertex_id);
+                                selection_primary.extend_from_slice(&[
+                                    vertex_id, opp.0, vertex_id, opp.1
+                                ]);
+                                selection_secondary.extend_from_slice(opp.as_ref());
                             }
+                            selection_draw_mode = gl::LINES;
                         },
                         Selection::Edge(edge, ref mut face_ids) => {
                             *face_ids = mesh.get_edge_face_ids(edge);
                             for &face_id in face_ids.iter() {
-                                let face_verts = mesh.get_face_points(mesh[face_id]);
-                                selection_highlight.extend_from_slice(&face_verts);
+                                let opp_edges = mesh[face_id].edges_opposite(edge);
+                                selection_secondary.extend_from_slice(opp_edges[0].as_ref());
+                                selection_secondary.extend_from_slice(opp_edges[1].as_ref());
                             }
+                            selection_primary.extend_from_slice(edge.as_ref());
+                            selection_draw_mode = gl::LINES;
                         },
                     }
-
-                    gl::BindVertexArray(highlight_vao);
-                    gl::BindBuffer(gl::ARRAY_BUFFER, highlight_points_vbo);
-                    gl::BufferData(
-                        gl::ARRAY_BUFFER,
-                        (size_of::<Point3<f32>>() * selection_highlight.len()) as GLsizeiptr,
-                        selection_highlight.as_ptr() as *const GLvoid,
-                        gl::DYNAMIC_DRAW,
-                    );
                 }
                 need_render = true;
             }
             need_selection_update = false;
-        }}
+        }
 
         // render scene
         if need_render { unsafe {
@@ -588,11 +613,23 @@ fn main() {
             );
 
             if selection.is_some() {
-                gl::BindVertexArray(highlight_vao);
-                let selected_color = Vector4::new(1.0, 1.0, 1.0, 0.5);
-                gl::VertexAttrib4fv(a_color, selected_color.as_ptr());
+                gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, 0);
 
-                gl::DrawArrays(gl::TRIANGLES, 0, selection_highlight.len() as GLsizei);
+                let selected_color = Vector4::new(1.0, 1.0, 1.0, 0.4);
+                gl::VertexAttrib4fv(a_color, selected_color.as_ptr());
+                gl::DrawElements(
+                    selection_draw_mode, selection_secondary.len() as GLsizei,
+                    gl::UNSIGNED_BYTE, selection_secondary.as_ptr() as *const GLvoid,
+                );
+
+                let selected_color = Vector4::new(1.0, 1.0, 1.0, 1.0);
+                gl::VertexAttrib4fv(a_color, selected_color.as_ptr());
+                gl::DrawElements(
+                    selection_draw_mode, selection_primary.len() as GLsizei,
+                    gl::UNSIGNED_BYTE, selection_primary.as_ptr() as *const GLvoid,
+                );
+
+                gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, mesh_ebo);
             }
             gl::Disable(gl::BLEND);
 
