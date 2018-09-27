@@ -95,7 +95,8 @@ fn main() {
         gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
         gl::BufferData(
             gl::ARRAY_BUFFER,
-            (size_of::<Vertex>() * mesh.verts.len()) as GLsizeiptr,
+            // HACK: len + 1 to allow storage for the edge bisection preview vertex
+            (size_of::<Vertex>() * (mesh.verts.len() + 1)) as GLsizeiptr,
             mesh.verts.as_ptr() as *const GLvoid,
             gl::STATIC_DRAW,
         );
@@ -325,7 +326,8 @@ fn main() {
             // convert raycast into selection
             let new_selection = raycast.map(|(pos, face_id)| {
                 let face = mesh[face_id];
-                let bary = barycentric(mesh.get_face_points(face), pos);
+                let face_points = mesh.get_face_points(face);
+                let bary = barycentric(&face_points, &pos);
 
                 const VERTEX_SELECT_THRESHOLD: f32 = 0.9;
                 const EDGE_SELECT_THRESHOLD:   f32 = 0.05;
@@ -339,15 +341,38 @@ fn main() {
                         |vertex_id| Selection::Vertex(vertex_id, Default::default())
                     )
                 ).or_else(|| // if not, check for edge selection
-                    {   if      bary.x <= EDGE_SELECT_THRESHOLD { Some(Edge(face.1, face.2)) }
-                        else if bary.y <= EDGE_SELECT_THRESHOLD { Some(Edge(face.2, face.0)) }
-                        else if bary.z <= EDGE_SELECT_THRESHOLD { Some(Edge(face.0, face.1)) }
-                        else                                    { None                       }
+                    {   if      bary.x <= EDGE_SELECT_THRESHOLD { Some(0) }
+                        else if bary.y <= EDGE_SELECT_THRESHOLD { Some(1) }
+                        else if bary.z <= EDGE_SELECT_THRESHOLD { Some(2) }
+                        else                                    { None    }
                     }.map(
-                        |edge|      Selection::Edge(edge, Default::default())
+                        |edge_num| {
+                            let edge = ((edge_num+1)%3, (edge_num+2)%3);
+
+                            let mut bary = bary;
+                            let normalize_factor = 1.0 - bary[edge_num];
+                            bary[edge_num] = 0.0;
+                            bary /= normalize_factor;
+                            let mouse_nearest_pos = bary[edge.0] * face_points[edge.0].to_vec()
+                                                  + bary[edge.1] * face_points[edge.1].to_vec();
+                            unsafe {
+                                // HACK: push bisection point to the end of the mesh vbo
+                                // to reference it as an index in the selection highlight
+                                gl::BindBuffer(gl::ARRAY_BUFFER, mesh_vbo);
+                                gl::BufferSubData(
+                                    gl::ARRAY_BUFFER,
+                                    (mesh.verts.len() * size_of::<Vertex>()) as GLintptr,
+                                    size_of::<Point3<f32>>() as GLsizeiptr,
+                                    mouse_nearest_pos.as_ptr() as *const GLvoid,
+                                );
+                                need_render = true;
+                            }
+                            let edge = Edge(face.as_ref()[edge.0], face.as_ref()[edge.1]);
+                            Selection::Edge(edge, Default::default())
+                        }
                     )
-                ).unwrap_or(  // otherwise select the whole face
-                                    Selection::Face(face_id)
+                ).unwrap_or( // otherwise select the whole face
+                    Selection::Face(face_id)
                 )
             });
 
@@ -378,9 +403,17 @@ fn main() {
                         Selection::Edge(edge, ref mut face_ids) => {
                             *face_ids = mesh.get_edge_face_ids(edge);
                             for &face_id in face_ids.iter() {
-                                let opp_edges = mesh[face_id].edges_opposite(edge);
+                                let face = mesh[face_id];
+
+                                let opp_edges = face.edges_opposite(edge);
                                 selection_secondary.extend_from_slice(opp_edges[0].as_ref());
                                 selection_secondary.extend_from_slice(opp_edges[1].as_ref());
+
+                                let opp_vertex_id = face.vertex_opposite(edge);
+                                selection_primary.extend_from_slice(&[
+                                    // HACK: edge bisection preview vertex at mesh.len
+                                    opp_vertex_id, VertexIndex(mesh.verts.len() as u8)
+                                ]);
                             }
                             selection_primary.extend_from_slice(edge.as_ref());
                             selection_draw_mode = gl::LINES;
@@ -447,7 +480,7 @@ fn main() {
     }
 }
 
-fn barycentric(t: [Point3<f32>; 3], p: Point3<f32>) -> Vector3<f32> {
+fn barycentric(t: &[Point3<f32>; 3], p: &Point3<f32>) -> Vector3<f32> {
     // algorithm from Real-Time Collision Detection, Christer Ericson
     let v0 = t[1] - t[0];
     let v1 = t[2] - t[0];
