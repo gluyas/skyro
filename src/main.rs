@@ -13,7 +13,7 @@ use cgmath::*;
 use mesh::*;
 
 use std::default::Default;
-use std::mem::size_of;
+use std::mem::{self, size_of};
 use std::os::raw::c_char;
 use std::ptr;
 
@@ -133,6 +133,10 @@ fn main() {
     let mut mouse_pos = <Point2<f32>>::new(0.0, 0.0);
     let mut mouse_move: Option<Vector2<f32>> = None;
     let mut mouse_down = false;
+    // TODO: clean up input state machine
+    let mut drag_vertex = false;
+    let mut bisect_edge = false;
+    let mut bisect_edge_vertex = Vertex::default();
 
     enum Selection {
         Face(FaceIndex),
@@ -142,17 +146,16 @@ fn main() {
     impl PartialEq for Selection {
         fn eq(&self, other: &Selection) -> bool {
             match (self, other) {
-                (Selection::Face(a),      Selection::Face(b))      => a == b,
-                (Selection::Vertex(a, _), Selection::Vertex(b, _)) => a == b,
-                (Selection::Edge(a, _),   Selection::Edge(b, _))   => a == b,
-                _                                                  => false,
+                (Selection::Face(a),      Selection::Face(b))       => a == b,
+                (Selection::Vertex(a, _), Selection::Vertex(b, _))  => a == b,
+                (Selection::Edge(a, _),   Selection::Edge(b, _))    => a == b,
+                _                                                   => false,
             }
         }
     }
     impl Eq for Selection {}
 
     let mut selection: Option<Selection> = None;
-    let mut selection_drag = false;
     let mut selection_primary:   Vec<VertexIndex> = Vec::new();
     let mut selection_secondary: Vec<VertexIndex> = Vec::new();
     let mut selection_draw_mode: GLenum = gl::TRIANGLES;
@@ -172,13 +175,15 @@ fn main() {
                 } => match state {
                     ElementState::Pressed  => {
                         mouse_down = true;
-                        if let Some(Selection::Vertex(..)) = selection {
-                            selection_drag = true;
+                        if        let Some(Selection::Vertex(..)) = selection {
+                            drag_vertex = true;
+                        } else if let Some(Selection::Edge(..))   = selection {
+                            bisect_edge = true;
                         }
                     },
                     ElementState::Released => {
                         mouse_down = false;
-                        selection_drag = false;
+                        drag_vertex = false;
                     },
                 },
                 WindowEvent::CursorMoved { position: pos, .. } => {
@@ -189,6 +194,7 @@ fn main() {
                     mouse_move = mouse_move.or(Some(Vector2::new(0.0, 0.0)))
                         .map(|movement| movement + (mouse_new_pos - mouse_pos));
                     mouse_pos = mouse_new_pos;
+                    bisect_edge = false; // don't bisect if mouse moves
                 },
                 WindowEvent::MouseWheel {
                     delta: MouseScrollDelta::LineDelta(_delta_x, delta_y), ..
@@ -219,9 +225,49 @@ fn main() {
             Ray { origin, direction }
         };
 
-        // handle mouse movement
-        if let Some(movement) = mouse_move {
-            if selection_drag {
+        // perform complex input actions:
+        if bisect_edge && !mouse_down { // mouse click (on edge: bisect action)
+            if let Some(Selection::Edge(edge, ref face_ids)) = selection {
+                mesh.verts.push(bisect_edge_vertex);
+                let bisect_vertex_id = VertexIndex(mesh.verts.len() as u8 - 1);
+
+                for &old_face_id in face_ids.iter() {
+                    let new_face = mesh[old_face_id];
+                    mesh.faces.push(new_face); // push a copy of old face
+                    let new_face_id = FaceIndex(mesh.faces.len() as u8 - 1);
+
+                    let swap_local_indicies = ( // insert bisect vert between edge points
+                        mesh[old_face_id].local_index_of(edge.0),
+                        mesh[new_face_id].local_index_of(edge.1),
+                    );
+                    mesh[old_face_id].as_mut()[swap_local_indicies.0] = bisect_vertex_id;
+                    mesh[new_face_id].as_mut()[swap_local_indicies.1] = bisect_vertex_id;
+                }
+
+                unsafe {
+                    gl::BindBuffer(gl::ARRAY_BUFFER, mesh_vbo);
+                    gl::BufferData(
+                        gl::ARRAY_BUFFER,
+                        // HACK: len + 1 to allow storage for the edge bisection preview vertex
+                        (size_of::<Vertex>() * (mesh.verts.len() + 1)) as GLsizeiptr,
+                        mesh.verts.as_ptr() as *const GLvoid,
+                        gl::STATIC_DRAW,
+                    );
+
+                    gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, mesh_ebo);
+                    gl::BufferData(
+                        gl::ELEMENT_ARRAY_BUFFER,
+                        (size_of::<Face>() * mesh.faces.len()) as GLsizeiptr,
+                        mesh.faces.as_ptr() as *const GLvoid,
+                        gl::STATIC_DRAW,
+                    );
+                    need_render = true;
+                    need_selection_update = true;
+                }
+            }
+            bisect_edge = false;
+        } else if let Some(movement) = mouse_move { // mouse movement
+            if drag_vertex {
                 let vertex_id = if let Some(Selection::Vertex(vertex_id, ..)) = selection {
                     vertex_id
                 } else { panic!("drag non-vertex selection"); };
@@ -346,15 +392,17 @@ fn main() {
                         else if bary.z <= EDGE_SELECT_THRESHOLD { Some(2) }
                         else                                    { None    }
                     }.map(
-                        |edge_num| {
-                            let edge = ((edge_num+1)%3, (edge_num+2)%3);
+                        |apex_index| {
+                            let edge_indices = ((apex_index+1)%3, (apex_index+2)%3);
 
                             let mut bary = bary;
-                            let normalize_factor = 1.0 - bary[edge_num];
-                            bary[edge_num] = 0.0;
+                            let normalize_factor = 1.0 - bary[apex_index];
+                            bary[apex_index] = 0.0;
                             bary /= normalize_factor;
-                            let mouse_nearest_pos = bary[edge.0] * face_points[edge.0].to_vec()
-                                                  + bary[edge.1] * face_points[edge.1].to_vec();
+                            let bisect_point = Point3::from_vec(
+                                bary[edge_indices.0] * face_points[edge_indices.0].to_vec() +
+                                bary[edge_indices.1] * face_points[edge_indices.1].to_vec()
+                            );
                             unsafe {
                                 // HACK: push bisection point to the end of the mesh vbo
                                 // to reference it as an index in the selection highlight
@@ -363,11 +411,21 @@ fn main() {
                                     gl::ARRAY_BUFFER,
                                     (mesh.verts.len() * size_of::<Vertex>()) as GLintptr,
                                     size_of::<Point3<f32>>() as GLsizeiptr,
-                                    mouse_nearest_pos.as_ptr() as *const GLvoid,
+                                    bisect_point.as_ptr() as *const GLvoid,
                                 );
                                 need_render = true;
                             }
-                            let edge = Edge(face.as_ref()[edge.0], face.as_ref()[edge.1]);
+                            let edge = Edge(
+                                face.as_ref()[edge_indices.0],
+                                face.as_ref()[edge_indices.1],
+                            );
+                            let bisect_color = (
+                                bary[edge_indices.0] * mesh[edge.0].color +
+                                bary[edge_indices.1] * mesh[edge.1].color
+                            );
+                            bisect_edge_vertex = Vertex {
+                                pos: bisect_point, color: bisect_color
+                            };
                             Selection::Edge(edge, Default::default())
                         }
                     )
@@ -479,6 +537,8 @@ fn main() {
         std::thread::sleep_ms(15); // TODO: calculate smarter sleep timing
     }
 }
+
+static mut FRAMES: usize = 0;
 
 fn barycentric(t: &[Point3<f32>; 3], p: &Point3<f32>) -> Vector3<f32> {
     // algorithm from Real-Time Collision Detection, Christer Ericson

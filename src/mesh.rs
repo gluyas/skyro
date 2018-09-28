@@ -35,7 +35,15 @@ impl Mesh {
                 if i == 2 { return face_ids; }
             }
         }
-        panic!("failed to find two faces adjacent to edge");
+        panic!("failed to find two faces adjacent to edge: {:?}", edge);
+    }
+
+    pub fn get_edge_verts(&self, edge: Edge) -> [Vertex; 2] {
+        [self[edge.0], self[edge.1]]
+    }
+
+    pub fn get_edge_points(&self, edge: Edge) -> [Point3<f32>; 2] {
+        [self[edge.0].pos, self[edge.1].pos]
     }
 
     pub fn get_face_verts(&self, face: Face) -> [Vertex; 3] {
@@ -92,6 +100,14 @@ impl Face {
             Edge(self.1, self.2),
             Edge(self.2, self.0),
         ]
+    }
+
+    // CLEANUP: better API for this kind of action
+    pub fn local_index_of(&self, target_id: VertexIndex) -> usize {
+        for (index, &vertex_id) in self.as_ref().iter().enumerate() {
+            if target_id == vertex_id { return index; }
+        }
+        panic!("target vertex id not found in face");
     }
 
     #[inline]
